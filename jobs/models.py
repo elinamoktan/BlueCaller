@@ -32,31 +32,37 @@ class ServiceCategory(models.Model):
     name = models.CharField(max_length=100)
     description = models.TextField(blank=True)
     icon = models.CharField(max_length=50, blank=True)
+    image = models.ImageField(upload_to='category_images/', blank=True, null=True)
     
     def __str__(self):
         return self.name
 
-# Services
 class Service(models.Model):
     category = models.ForeignKey(ServiceCategory, on_delete=models.CASCADE, related_name='services')
     name = models.CharField(max_length=100)
     description = models.TextField()
     base_pricing_type = models.CharField(max_length=20, choices=PRICING_TYPES)
     image = models.ImageField(upload_to='service_images/', blank=True, null=True)
+    is_active = models.BooleanField(default=True)
     
     def __str__(self):
         return f"{self.category.name} - {self.name}"
 
-# Service SubTasks
 class SubTask(models.Model):
     service = models.ForeignKey(Service, on_delete=models.CASCADE, related_name='subtasks')
     name = models.CharField(max_length=100)
     description = models.TextField()
     default_pricing_type = models.CharField(max_length=20, choices=PRICING_TYPES)
-    
+    duration = models.CharField(max_length=100, blank=True)  # e.g., "1 day", "2 hours"
+    materials_included = models.BooleanField(default=False)
+    special_offer = models.BooleanField(default=False)
+    offer_price = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    original_price = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    requirements = models.TextField(blank=True)
+    image = models.ImageField(upload_to="subtask_images/", blank=True, null=True)   
     def __str__(self):
         return f"{self.service.name} - {self.name}"
-
+        
 # Worker Model
 class Worker(models.Model):
     owner = models.OneToOneField(User, on_delete=models.CASCADE)
