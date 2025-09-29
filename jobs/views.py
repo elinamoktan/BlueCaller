@@ -3,7 +3,7 @@ from django.http import HttpResponse, HttpResponseForbidden, JsonResponse
 from django.views.generic import ListView, DetailView, CreateView
 from django.urls import reverse_lazy
 from django.contrib.auth.decorators import login_required
-from jobs.models import Worker, Customer, Appointment, WorkerRating, Service, WorkerService, WorkerSubTaskPricing
+from jobs.models import Worker, Customer, Appointment, WorkerRating, Service, WorkerService, WorkerSubTaskPricing, ServiceCategory, SubTask
 from django.contrib.auth.mixins import LoginRequiredMixin
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.contrib import messages
@@ -19,17 +19,52 @@ from datetime import date
 from math import radians, sin, cos, sqrt, asin
 from django.core.paginator import Paginator
 from django.template.defaultfilters import register
-from django.contrib.auth import logout
+from django.contrib.auth import logout, login, authenticate
 from django.conf import settings
 from django.template.loader import render_to_string
 from django.utils.html import strip_tags
 import logging
+from django.contrib.auth.models import User
+
+# OTP imports
+from otp_auth.models import OTP
+from otp_auth.utils import send_otp_via_email
 
 # Configure logging for email failures
 logger = logging.getLogger(__name__)
 
 def index(request):
     return HttpResponse("<h1>BlueCaller</h1>")
+
+def service_categories(request):
+    """
+    View to display all service categories with their services, subtasks, durations, and pricing
+    """
+    categories = ServiceCategory.objects.all().prefetch_related(
+        'services', 
+        'services__subtasks'
+    )
+    
+    # Get worker services with pricing if user is authenticated and is a worker
+    worker_services = None
+    if request.user.is_authenticated:
+        try:
+            worker = Worker.objects.get(owner=request.user)
+            worker_services = WorkerService.objects.filter(
+                worker=worker
+            ).prefetch_related(
+                'pricing',
+                'pricing__subtask'
+            )
+        except Worker.DoesNotExist:
+            pass
+    
+    context = {
+        'categories': categories,
+        'worker_services': worker_services,
+    }
+    
+    return render(request, 'jobs/service_categories.html', context)
 
 # Enhanced email functions with better formatting and error handling
 def send_appointment_request_email(worker, appointment):
@@ -587,10 +622,165 @@ class WorkerDetailView(LoginRequiredMixin, DetailView):
             'services_with_pricing': services_with_pricing,
             'portfolio_images': portfolio_images,
             'distance_km': distance_km,
+            'today': date.today(),  # Add today's date
         })
         
         return context
 
+# ENHANCED: API endpoint for worker services with detailed information
+# Add this to your views.py - Fixed worker_services_api function
+
+@login_required
+def worker_services_api(request, worker_id):
+    """API endpoint to get worker's services data with detailed information for frontend"""
+    worker = get_object_or_404(Worker, id=worker_id)
+    
+    # Get all services for this worker with their subtasks and pricing
+    worker_services = WorkerService.objects.filter(
+        worker=worker, 
+        is_available=True
+    ).select_related(
+        'service', 'service__category'
+    ).prefetch_related(
+        'pricing__subtask'
+    )
+    
+    # Group services by category
+    categories_data = {}
+    
+    for worker_service in worker_services:
+        category = worker_service.service.category
+        service = worker_service.service
+        
+        # Initialize category data if not exists
+        if category.id not in categories_data:
+            categories_data[category.id] = {
+                'id': category.id,
+                'name': category.name,
+                'description': category.description or '',
+                'icon': category.icon or 'wrench',
+                'services': []
+            }
+        
+        # Get subtasks with pricing for this service
+        pricing_entries = WorkerSubTaskPricing.objects.filter(
+            worker_service=worker_service
+        ).select_related('subtask')
+        
+        for pricing in pricing_entries:
+            subtask = pricing.subtask
+            
+            # Build features list
+            features = [
+                "Professional service provider",
+                "Quality work guaranteed",
+                "Customer support included"
+            ]
+            
+            if pricing.experience_level:
+                features.insert(0, f"{pricing.experience_level.title()} level expertise")
+            
+            if subtask.materials_included:
+                features.append("Materials included in price")
+            
+            # Determine pricing display
+            pricing_display = f"₹{pricing.price}"
+            if pricing.pricing_type == 'hourly':
+                pricing_display += f"/hour (min {pricing.min_hours} hrs)"
+            elif pricing.pricing_type == 'sqft':
+                pricing_display += "/sq.ft"
+            elif pricing.pricing_type == 'unit':
+                pricing_display += "/unit"
+            elif pricing.pricing_type == 'shift':
+                pricing_display += "/shift"
+            elif pricing.pricing_type == 'inspection':
+                pricing_display += "/inspection"
+            
+            # Build service item
+            service_item = {
+                'id': pricing.id,
+                'title': subtask.name,
+                'description': subtask.description,
+                'detailed_description': getattr(subtask, 'detailed_description', ''),
+                'price': pricing_display,
+                'base_price': float(pricing.price),
+                'pricing_type': pricing.pricing_type,
+                'pricing_type_display': pricing.get_pricing_type_display(),
+                'complexity': pricing.experience_level or 'Standard',
+                'duration': subtask.duration or f"Starting from {pricing.min_hours or 1} hour(s)",
+                'requirements': subtask.requirements or '',
+                'features': features,
+                'image': service.image.url if service.image else None,
+                'night_shift_extra': float(pricing.night_shift_extra) if pricing.night_shift_extra else 0,
+                'has_offer': subtask.special_offer,
+                'offer_details': {
+                    'original_price': float(subtask.original_price) if subtask.original_price else float(pricing.price),
+                    'offer_price': float(subtask.offer_price) if subtask.offer_price else float(pricing.price),
+                } if subtask.special_offer else {},
+                'requires_inspection': pricing.price == 0,
+                'inspection_price_display': 'Price upon inspection' if pricing.price == 0 else '',
+                'terms_conditions': 'Terms and conditions apply',
+                'materials_included': subtask.materials_included
+            }
+            
+            categories_data[category.id]['services'].append(service_item)
+    
+    # If no services found, create a default structure
+    if not categories_data:
+        categories_data['general'] = {
+            'id': 'general',
+            'name': 'General Services',
+            'description': 'Professional services offered by our expert',
+            'icon': 'wrench',
+            'services': [{
+                'id': 'consultation',
+                'title': f'Consultation with {worker.name}',
+                'description': worker.bio or 'Professional consultation and service assessment',
+                'detailed_description': '',
+                'price': '₹500/hour',
+                'base_price': 500,
+                'pricing_type': 'hourly',
+                'pricing_type_display': 'Hourly Rate',
+                'complexity': 'Standard',
+                'duration': '1 hour minimum',
+                'requirements': 'Contact for specific requirements',
+                'features': [
+                    'Professional consultation',
+                    'Expert advice',
+                    'Quality service',
+                    'Customer support'
+                ],
+                'image': worker.profile_pic.url if worker.profile_pic else None,
+                'night_shift_extra': 0,
+                'has_offer': False,
+                'offer_details': {},
+                'requires_inspection': False,
+                'inspection_price_display': '',
+                'terms_conditions': 'Terms and conditions apply',
+                'materials_included': False
+            }]
+        }
+    
+    categories_list = list(categories_data.values())
+    
+    response_data = {
+        'worker': {
+            'id': worker.id,
+            'name': worker.name,
+            'tagline': worker.tagline,
+            'bio': worker.bio or '',
+            'profile_pic': worker.profile_pic.url if worker.profile_pic else None,
+            'phone_number': str(worker.phone_number),
+            'average_rating': float(worker.average_rating),
+            'total_ratings': worker.rating_count,
+            'verified': worker.verified
+        },
+        'categories': categories_list
+    }
+    
+    return JsonResponse(response_data)
+
+    
 # Class-based view for creating a worker profile
 class WorkerCreateView(LoginRequiredMixin, CreateView):
     model = Worker
@@ -641,10 +831,17 @@ class CustomerCreateView(LoginRequiredMixin, CreateView):
         
         return super(CustomerCreateView, self).form_valid(form)
 
+# MODIFIED: Enhanced handle_login with OTP integration
 @login_required
 def handle_login(request):
     # If user is already authenticated, redirect based on their profile type
     if request.user.is_authenticated:
+        # Check if user needs OTP verification for login
+        if request.session.get('needs_login_otp'):
+            user_id = request.session.get('login_user_id')
+            if user_id:
+                return redirect('verify_login_otp', user_id=user_id)
+        
         # Try to detect worker profile
         try:
             worker = request.user.worker
@@ -663,7 +860,79 @@ def handle_login(request):
         return render(request, 'jobs/choose_account.html', {})
     
     # If user is not authenticated, redirect to login page
-    return redirect('login')  # Assuming you have a login URL named 'login'
+    return redirect('account_login')
+
+# NEW: Custom login view with OTP integration
+def custom_login(request):
+    """
+    Custom login view that integrates OTP verification
+    This should replace your existing allauth login view
+    """
+    if request.user.is_authenticated:
+        return redirect('handle_login')
+    
+    if request.method == 'POST':
+        username = request.POST.get('login')
+        password = request.POST.get('password')
+        
+        # Authenticate user
+        user = authenticate(request, username=username, password=password)
+        
+        if user is not None:
+            # Generate OTP for login verification
+            otp = OTP.create_otp(user, "login")
+            send_otp_via_email(user, otp.code)
+            
+            # Store user ID in session for OTP verification
+            request.session['needs_login_otp'] = True
+            request.session['login_user_id'] = user.id
+            
+            messages.info(request, "An OTP has been sent to your email. Please verify to login.")
+            return redirect('verify_login_otp', user_id=user.id)
+        else:
+            messages.error(request, "Invalid credentials. Please try again.")
+    
+    # If GET request or failed authentication, show login form
+    from allauth.account.views import LoginView
+    return LoginView.as_view()(request)
+
+# NEW: Custom signup view with OTP integration  
+def custom_signup(request):
+    """
+    Custom signup view that integrates OTP verification
+    This should replace your existing allauth signup view
+    """
+    if request.user.is_authenticated:
+        return redirect('handle_login')
+    
+    if request.method == 'POST':
+        # Use allauth's signup form
+        from allauth.account.forms import SignupForm
+        form = SignupForm(request.POST)
+        
+        if form.is_valid():
+            # Create user but don't activate yet
+            user = form.save(commit=False)
+            user.is_active = False  # User will be activated after OTP verification
+            user.save()
+            
+            # Generate OTP for signup verification
+            otp = OTP.create_otp(user, "signup")
+            send_otp_via_email(user, otp.code)
+            
+            # Store user ID in session for OTP verification
+            request.session['needs_signup_otp'] = True
+            request.session['signup_user_id'] = user.id
+            
+            messages.info(request, "An OTP has been sent to your email. Please verify to complete registration.")
+            return redirect('verify_signup_otp', user_id=user.id)
+    else:
+        from allauth.account.forms import SignupForm
+        form = SignupForm()
+    
+    # Use allauth's signup template
+    from allauth.account.views import SignupView
+    return SignupView.as_view()(request)
 
 @login_required
 def appoint_worker(request, worker_id):
@@ -1432,3 +1701,300 @@ def get_time_ago(dt):
         return f'{minutes} minute{"s" if minutes > 1 else ""} ago'
     else:
         return 'Just now'
+    
+
+@login_required
+def appointment_request(request, worker_id):
+    """View to handle appointment request form"""
+    worker = get_object_or_404(Worker, id=worker_id)
+    
+    # Check if user has a customer profile
+    try:
+        customer = request.user.customer
+    except AttributeError:
+        messages.error(request, "You need a customer profile to book appointments.")
+        return redirect('customer-create')
+
+    if request.method == "POST":
+        # Get form data from the booking modal
+        service_id = request.POST.get("service_id")
+        preferred_date = request.POST.get("preferred_date")
+        preferred_time = request.POST.get("preferred_time")
+        address = request.POST.get("address", "")
+        special_instructions = request.POST.get("special_instructions", "")
+
+        # Validate required fields
+        if not all([service_id, preferred_date, preferred_time, address]):
+            messages.error(request, "Please fill in all required fields.")
+            return redirect('worker-detail', pk=worker_id)
+
+        try:
+            # Parse preferred time slot (e.g., "09:00-11:00")
+            if '-' in preferred_time:
+                start_time = preferred_time.split('-')[0]
+            else:
+                start_time = preferred_time
+            
+            # Create appointment datetime
+            datetime_str = f"{preferred_date} {start_time}"
+            appointment_datetime = make_aware(datetime.strptime(datetime_str, "%Y-%m-%d %H:%M"))
+            
+            # Check if appointment is in the future
+            if appointment_datetime <= now():
+                messages.error(request, "You can only book appointments for future dates/times.")
+                return redirect('worker-detail', pk=worker_id)
+
+            # Check for conflicting appointments
+            conflicting_appointments = Appointment.objects.filter(
+                worker=worker,
+                appointment_date__date=appointment_datetime.date(),
+                appointment_date__hour__range=(
+                    appointment_datetime.hour, 
+                    appointment_datetime.hour + 2
+                ),
+                status__in=['pending', 'accepted']
+            )
+            
+            if conflicting_appointments.exists():
+                messages.error(request, "Worker already has an appointment during this time slot.")
+                return redirect('worker-detail', pk=worker_id)
+
+            # Get service subtask pricing if service_id is provided
+            service_subtask = None
+            if service_id and service_id != 'default':
+                try:
+                    service_subtask = WorkerSubTaskPricing.objects.get(id=service_id)
+                except WorkerSubTaskPricing.DoesNotExist:
+                    pass
+
+            # Create appointment
+            appointment = Appointment.objects.create(
+                customer=customer,
+                worker=worker,
+                appointment_date=appointment_datetime,
+                status="pending",
+                service_subtask=service_subtask,
+                location=address,
+                special_instructions=special_instructions
+            )
+
+            # Send email notification to worker
+            try:
+                send_appointment_request_email(worker, appointment)
+                logger.info(f"Appointment request email sent successfully for appointment {appointment.id}")
+            except Exception as email_error:
+                logger.error(f"Email sending failed for appointment {appointment.id}: {email_error}")
+                messages.warning(request, "Appointment created but email notification may have failed.")
+            
+            messages.success(request, "Appointment request sent successfully!")
+            return redirect('customer_appointments')
+
+        except ValueError as e:
+            logger.error(f"Error parsing datetime: {e}")
+            messages.error(request, "Invalid appointment date or time format.")
+            return redirect('worker-detail', pk=worker_id)
+        except Exception as e:
+            logger.error(f"Unexpected error in appointment_request: {e}")
+            messages.error(request, "An error occurred while processing your request. Please try again.")
+            return redirect('worker-detail', pk=worker_id)
+    
+    # GET request - redirect to worker detail
+    return redirect('worker-detail', pk=worker_id)
+
+
+# Add this new view to your views.py
+
+# In your views.py - Corrected worker_service_details view
+@login_required
+def worker_service_details(request, worker_id):
+    worker = get_object_or_404(Worker, id=worker_id)
+    
+    # Get worker services with pricing from database
+    worker_services = WorkerService.objects.filter(
+        worker=worker, 
+        is_available=True
+    ).select_related('service', 'service__category').prefetch_related(
+        'pricing__subtask'
+    )
+    
+    # Organize services by category
+    categories_data = {}
+    
+    for worker_service in worker_services:
+        category = worker_service.service.category
+        
+        if category.id not in categories_data:
+            categories_data[category.id] = {
+                'id': category.id,
+                'name': category.name,
+                'description': category.description or '',
+                'icon': category.icon or '🔧',
+                'services': []
+            }
+        
+        # Get pricing for each subtask
+        pricing_entries = WorkerSubTaskPricing.objects.filter(
+            worker_service=worker_service
+        ).select_related('subtask')
+        
+        for pricing in pricing_entries:
+            subtask = pricing.subtask
+            
+            # Determine pricing display from database
+            pricing_display = f"₹{pricing.price}"
+            if pricing.pricing_type == 'hourly':
+                pricing_display += f"/hour"
+                if pricing.min_hours > 1:
+                    pricing_display += f" (min {pricing.min_hours} hrs)"
+            elif pricing.pricing_type == 'sqft':
+                pricing_display += "/sq.ft"
+            elif pricing.pricing_type == 'unit':
+                pricing_display += "/unit"
+            elif pricing.pricing_type == 'shift':
+                pricing_display += "/shift"
+            elif pricing.pricing_type == 'inspection':
+                pricing_display += "/inspection"
+            
+            # Build features list from database fields
+            features = []
+            
+            # Add experience level if available
+            if pricing.experience_level:
+                features.append(f"{pricing.get_experience_level_display()} expertise")
+            
+            # Add materials information
+            if subtask.materials_included:
+                features.append("Materials included")
+            else:
+                features.append("Materials not included")
+            
+            # Add pricing type information
+            features.append(f"{pricing.get_pricing_type_display()}")
+            
+            # Add night shift option if available
+            if pricing.night_shift_extra and pricing.night_shift_extra > 0:
+                features.append(f"Night shift +₹{pricing.night_shift_extra}")
+            
+            # Add standard features
+            features.extend(["Professional service", "Quality guaranteed"])
+            
+            # Get image - prioritize subtask image, fallback to service image
+            image_url = None
+            if subtask.image:
+                image_url = subtask.image.url
+            elif worker_service.service.image:
+                image_url = worker_service.service.image.url
+            
+            service_data = {
+                'id': pricing.id,
+                'name': subtask.name,
+                'description': subtask.description,
+                'detailed_description': getattr(subtask, 'detailed_description', ''),
+                'price_display': pricing_display,
+                'base_price': float(pricing.price),
+                'pricing_type': pricing.pricing_type,
+                'pricing_type_display': pricing.get_pricing_type_display(),
+                'duration': subtask.duration or 'Varies based on project',
+                'experience_level': pricing.experience_level,
+                'experience_level_display': pricing.get_experience_level_display(),
+                'features': features,
+                'requirements': subtask.requirements or 'Standard requirements apply',
+                'materials_included': subtask.materials_included,
+                'night_shift_extra': float(pricing.night_shift_extra) if pricing.night_shift_extra else 0,
+                'min_hours': pricing.min_hours,
+                'special_offer': subtask.special_offer,
+                'offer_price': float(subtask.offer_price) if subtask.offer_price else None,
+                'original_price': float(subtask.original_price) if subtask.original_price else None,
+                'image': image_url,  # Add the image URL here
+            }
+            
+            categories_data[category.id]['services'].append(service_data)
+    
+    # If no services found, check if worker has any services defined in the system
+    if not categories_data:
+        # Try to get services based on worker's existing relationships or tagline
+        worker_category = "General Services"
+        
+        # Check if worker has any services in the system (even if not available)
+        all_worker_services = WorkerService.objects.filter(worker=worker)
+        if all_worker_services.exists():
+            # Worker has services but they might not be available
+            categories_data['unavailable'] = {
+                'id': 'unavailable',
+                'name': 'Services Temporarily Unavailable',
+                'description': 'This worker\'s services are currently not available. Please check back later or contact them directly.',
+                'icon': '⏸️',
+                'services': []
+            }
+        else:
+            # No services defined at all - show consultation option
+            categories_data['consultation'] = {
+                'id': 'consultation',
+                'name': 'Professional Consultation',
+                'description': f'Contact {worker.name} for a custom quote based on your specific needs',
+                'icon': '💬',
+                'services': [{
+                    'id': 'consultation',
+                    'name': f'Consultation with {worker.name}',
+                    'description': worker.bio or 'Professional consultation and project assessment',
+                    'detailed_description': '',
+                    'price_display': 'Contact for pricing',
+                    'base_price': 0,
+                    'pricing_type': 'consultation',
+                    'pricing_type_display': 'Custom Quote',
+                    'duration': '1 hour minimum',
+                    'experience_level': 'expert',
+                    'experience_level_display': 'Expert',
+                    'features': [
+                        'Professional assessment',
+                        'Customized solution',
+                        'Detailed quote',
+                        'Expert advice'
+                    ],
+                    'requirements': 'Please describe your project requirements',
+                    'materials_included': False,
+                    'night_shift_extra': 0,
+                    'min_hours': 1,
+                    'special_offer': False,
+                    'offer_price': None,
+                    'original_price': None,
+                    'image': worker.profile_pic.url if worker.profile_pic else None,
+                }]
+            }
+    
+    context = {
+        'worker': worker,
+        'categories_data': list(categories_data.values()),
+        'worker_name': worker.name,
+        'worker_tagline': worker.tagline,
+        'worker_bio': worker.bio or 'Professional service provider',
+        'worker_phone': str(worker.phone_number),
+        'worker_profile_pic': worker.profile_pic.url if worker.profile_pic else None,
+        'worker_verified': worker.verified,
+        'today': date.today().isoformat(),
+    }
+    
+    return render(request, 'jobs/worker_service_details.html', context)
+    
+def get_category_icon(category_name):
+    """Helper function to get appropriate icon based on category name"""
+    category_icons = {
+        'plumbing': '🔧',
+        'electrical': '⚡',
+        'painting': '🎨',
+        'cleaning': '🧹',
+        'carpentry': '🔨',
+        'construction': '🏗️',
+        'repair': '🔧',
+        'maintenance': '⚙️',
+        'installation': '🔧',
+        'design': '📐',
+    }
+    
+    category_lower = category_name.lower()
+    for key, icon in category_icons.items():
+        if key in category_lower:
+            return icon
+    
+    return '🔧'  # Default icon
+
